@@ -95,7 +95,6 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
     '_alignmsk', # Derived alignment mask
     '_minsize' , # Minimum allocation size
     '_paranoia', # Self-tests
-    '_revoke_k', # Number of regions to simultaneously revoke
 
     '_tslam'   , # fetch the current trace timestamp
 
@@ -121,20 +120,14 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
   @staticmethod
   def _init_add_args(argp) :
     argp.add_argument('--paranoia', action='store', type=int, default=0)
-    argp.add_argument('--revoke-k', action='store', type=int, default=16)
     argp.add_argument('--min-size', action='store', type=int, default=16)
     argp.add_argument('--align-log', action='store', type=int, default=2)
-    argp.add_argument('--unsafe-reuse', action='store_const', const=True,
-                      default=False,
-                      help='free immediately to reusable state')
 
   def _init_handle_args(self, args) :
     self._alignlog        = args.align_log
     self._alignmsk        = (1 << args.align_log) - 1
 
     self._minsize         = args.min_size
-    if args.unsafe_reuse :
-      self._free = self._free_unsafe
 
     self._paranoia        = args.paranoia
     if self._paranoia == 0 and __debug__ :
@@ -143,8 +136,6 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
     if self._paranoia != 0 and not __debug__ :
         raise ValueError("Paranoia without assertions will just be slow")
 
-    assert args.revoke_k > 0
-    self._revoke_k        = args.revoke_k
 
 # --------------------------------------------------------------------- }}}
 
@@ -281,7 +272,11 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
   #
   # Inserts the coalesced span at the end of tidylst.
   def _mark_tidy(self, loc, sz):
+      self._eva2sst.mark(loc, sz, SegSt.TIDY)
       self._tidylst.insert(loc, sz)
+
+  def _mark_revoked(self, loc, sz):
+      self._mark_tidy(loc, sz)
 
   # An actual implementation would maintain a prioqueue or something;
   # we can get away with a linear scan.  We interrogate the segment state
@@ -331,7 +326,7 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
       assert qv in sst_tj, "Revoking non-revokable span"
       if qv == SegSt.JUNK :
         self._junklru.remove(self._junkadn.pop(qb))
-        self._mark_tidy(qb, qsz)
+        self._mark_revoked(qb, qsz)
 
    self._publish('revoked', "---", "", *((loc, loc+sz) for (_, loc, sz) in ss))
 
@@ -405,10 +400,6 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
         (reqbase, reqsz), (qbase, qsz, qv), list(self._eva2sst))
       assert qbase + qsz >= reqbase + reqsz, "New allocated undersized?"
 
-    # Homesteading beyond the wildnerness frontier leaves a TIDY gap
-    if reqbase > self._wildern :
-      self._mark_tidy(self._wildern, reqbase - self._wildern)
-
     # Remove span from tidy list; may create two more entries.
     # No need to use the coalescing insert functionality here because we
     # know, inductively, that we certainly won't coalesce in either direction.
@@ -426,12 +417,24 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
       assert qsz >= reqsz
       tsz = self._tidylst.remove(qb)
       assert tsz == qsz
+
+      # Do the marking now, so that our work on our tidy list sees the
+      # correct (lack of) coalescing hereafter, but above we wanted to find
+      # the whole TIDY span.  The duplication with the else branch below is
+      # a little sad. :/
+      self._eva2sst.mark(reqbase, reqsz, SegSt.WAIT)
+
       if qb + qsz != reqbase + reqsz :
         # Insert residual right span
         self._tidylst.insert(reqbase+reqsz, qb+qsz-reqbase-reqsz)
       if reqbase != qb :
         # Insert residual left span
         self._tidylst.insert(qb, reqbase-qb)
+    else :
+      # Homesteading beyond the wildnerness frontier leaves a TIDY gap
+      if reqbase > self._wildern :
+        self._mark_tidy(self._wildern, reqbase - self._wildern)
+      self._eva2sst.mark(reqbase, reqsz, SegSt.WAIT)
 
     # If the allocation takes place within the current best revokable span,
     # invalidate the cache and let the revocation heuristic reconstruct it.
@@ -442,7 +445,6 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
 
     self._nwait += reqsz
     self._wildern = max(self._wildern, reqbase + reqsz)
-    self._eva2sst.mark(reqbase, reqsz, SegSt.WAIT)
 
   def _alloc(self, stk, tid, sz) :
     if self._paranoia > PARANOIA_STATE_PER_OPER : self._state_asserts()
@@ -451,6 +453,8 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
     sz = (sz + self._alignmsk) & ~self._alignmsk # and alignment
 
     loc = self._alloc_place(stk, sz)
+
+    assert loc & self._alignmsk == 0
 
     self._ensure_mapped(stk,tid,loc,sz)
     self._mark_allocated(loc,sz)
@@ -510,7 +514,7 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
     # If the present TIDY span is quite large, go ahead and do an unmap
     # XXX configurable policy
     (qb, qsz, qv) = self._eva2sst.get(loc)
-    assert qv == SegSt.TIDY
+    assert qv == SegSt.TIDY, (loc, sz, qb, qsz, qv, list(x for x in self._eva2sst))
     if qsz > (16 * 2**self._pagelog) :
       self._ensure_unmapped(stk, tid, qb, qsz)
 
