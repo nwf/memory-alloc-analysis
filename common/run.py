@@ -198,3 +198,15 @@ class Unrun:
 
     def sweep_size_measured(self, publ, size):
         print("%d\t%d\t%d" % (self._tslam(), self._last_measured_size, size))
+
+class PeriodicRunListener:
+  __slots__ = ('count', 'freq')
+  def __init__(self, freq) :
+    self.count = 0
+    self.freq = freq
+  def _common(self) :
+    if (self.count + 1) % self.freq == 0 : self._do()
+    self.count += 1
+  def allocd(self,*a) : self._common()
+  def freed(self,*a) : self._common()
+  def reallocd(self,*a) : self._common()
