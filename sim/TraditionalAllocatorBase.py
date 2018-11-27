@@ -180,6 +180,9 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
 
   def _npg2nby(self, npg) : return npg << self._pagelog
 
+  def _eva_align_roundup(self, eva) :
+   return ((eva + self._alignmsk) >> self._alignlog) << self._alignlog
+
 # --------------------------------------------------------------------- }}}
 # Additional state assertions and diagnostics ------------------------- {{{
 
@@ -239,6 +242,7 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
           asz = self._eva2sz.get(ab, None)
           assert asz is not None, ("WAIT w/o alloc sz", qb, ab)
           ab += asz
+        assert ab == qb + qsz, "Allocations overrun WAIT segment?"
       elif qv == SegSt.TIDY :
         assert qsz == self._tidylst.peek(qb)
       elif qv == SegSt.JUNK :
@@ -373,15 +377,16 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
 
   def _alloc_place(self, stk, sz) :
     # XXX Approximate best-fit / oldest-fit strategy, since coalesced
-    # entries are moved to the back of the tidy list.  A segregated free
-    # list would probably improve modeling time performance dramatically.
+    # entries are moved to the back of the tidy list.
     #
-    # Note the requirement to either fit exactly or leave at least 16 bytes
-    # free.
-    try :
-      return next(self._tidylst.iterfor(sz, 16))[0]
-    except StopIteration :
-      return self._wildern
+    # Note the requirement to either fit exactly or leave some threshold
+    # of bytes available. (XXX but it's not quite the right test, is it?)
+    #
+    for (pos, psz) in self._tidylst.iterfor(sz, 1 << self._alignlog) :
+      apos = self._eva_align_roundup(pos)
+      if apos == pos : return pos
+      elif pos + psz >= apos + sz : return apos
+    return self._eva_align_roundup(self._wildern)
 
   def _ensure_mapped(self, stk, tid, reqbase, reqsz) :
     pbase = self._eva2evp(reqbase)
@@ -396,7 +401,16 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
       self._publish('mapd', stk, tid, self._evp2eva(b), self._evp2eva(l), 0b11)
     self._evp2pst.mark(pbase, plim-pbase, PageSt.MAPD)
 
-  def _mark_allocated(self, reqbase, reqsz) :
+  # When marking a span allocated, we may have residual TIDY segments left
+  # over.  Because overriding implementatins may be tracking their own
+  # metadata about TIDY spans, we provide this hook for intercepting without
+  # having to duplicate all the work doen in _mark_allocated.  Unlike
+  # _mark_tidy, these spans are already marked TIDY, they are just not in
+  # the TIDY metadata structures.
+  def _mark_allocated_residual(self, stk, loc, sz, isLeft):
+    self._tidylst.insert(loc, sz)
+
+  def _mark_allocated(self, stk, reqbase, reqsz) :
     if self._paranoia > PARANOIA_STATE_PER_OPER:
       (qbase, qsz, qv) = self._eva2sst.get(reqbase, coalesce_with_values=sst_at)
       assert qv in sst_at, ("New allocated mark in bad state", \
@@ -429,10 +443,10 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
 
       if qb + qsz != reqbase + reqsz :
         # Insert residual right span
-        self._tidylst.insert(reqbase+reqsz, qb+qsz-reqbase-reqsz)
+        self._mark_allocated_residual(stk, reqbase+reqsz, qb+qsz-reqbase-reqsz, False)
       if reqbase != qb :
         # Insert residual left span
-        self._tidylst.insert(qb, reqbase-qb)
+        self._mark_allocated_residual(stk, qb, reqbase-qb, True)
     else :
       # Homesteading beyond the wildnerness frontier leaves a TIDY gap
       if reqbase > self._wildern :
@@ -460,7 +474,7 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
     assert loc & self._alignmsk == 0
 
     self._ensure_mapped("malloc " + stk,tid,loc,sz)
-    self._mark_allocated(loc,sz)
+    self._mark_allocated(stk, loc, sz)
     self._eva2sz[loc] = sz
     return (loc, sz)
 
