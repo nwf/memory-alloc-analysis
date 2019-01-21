@@ -41,7 +41,8 @@ class SegSt(Enum):
   AHWM = 1 # "wilderness", tidy
   TIDY = 2
   WAIT = 3
-  JUNK = 4
+  PEND = 4
+  JUNK = 5
   __repr__ = Enum.__str__
 
 sst_atj = { SegSt.AHWM, SegSt.TIDY, SegSt.JUNK }
@@ -68,15 +69,19 @@ class PageSt(Enum):
 #   enough to contain it and must ensure that the backing page(s) are
 #   mapped.  The span is converted to a single segment and marked WAIT.
 #
-#   When freeing, we transition the whole segment to JUNK.  We may,
+#   When freeing safely, we transition the whole segment to JUNK.  We may,
 #   optionally, unmap any whole pages underlying this free, or may choose to
-#   defer unmapping to some later time.
+#   defer unmapping to some later time.  Unsafe freeing is similar, but
+#   queues to TIDY instead.  This base allocator also understands that it is
+#   possible that some memory, while free, is neither immediately reusable
+#   nor revokable; this state we call PEND(ing).  We assume that someone
+#   will eventually tell us when this condition no longer holds.
 #
 #   At some point, we will decide to attempt to reduce our physical memory
 #   footprint by unmapping whole pages contained within JUNK (or TIDY)
 #   segments.  Also at some point, we will decide to begin reusing virtual
-#   address space, engaging in revocation, transitioning spans back to
-#   TIDY segments for subsequent reallocation.
+#   address space, engaging in revocation, transitioning JUNK (or TIDY)
+#   spans back to TIDY segments for subsequent reallocation.
 
 # This allocator maintains two linked lists: a collection of JUNK spans, for
 # use with revocation, and an explicit free list of TIDY spans.  The latter
@@ -108,6 +113,7 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
     '_junkadn' , # JUNK segment base EVA to node in junklru
     '_njunk'   , # Number of bytes JUNK
     '_nmapped' , # Number of bytes MAPD
+    '_npend'   , # Number of bytes in PEND state
     '_nwait'   , # Number of bytes WAIT (allocated)
     '_pagelog' , # Base-2 log of page size
     '_tidylst' , # SegFreeList of TIDY spans
@@ -165,6 +171,7 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
     self._junkadn  = {}
     self._njunk    = 0
     self._nmapped  = 0
+    self._npend    = 0
     self._nwait    = 0
     self._tidylst  = SegFreeList(extcoal=self._sfl_coalesce)
     self._wildern  = baseva
@@ -234,6 +241,7 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
     # correspond with entries in their queues
     nwait = 0
     njunk = 0
+    npend = 0
     for (qb, qsz, qv) in self._eva2sst :
       if qv == SegSt.WAIT :
         nwait += qsz
@@ -252,8 +260,11 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
         assert dln.value == (qb, qsz)
       elif qv == SegSt.AHWM :
         assert qb == self._wildern, "There must be only one final frontier"
+      elif qv == SegSt.PEND :
+        npend += qsz
     assert nwait == self._nwait, ("Improper account of WAIT bytes", nwait, self._nwait)
     assert njunk == self._njunk, ("Improper account of JUNK bytes", njunk, self._njunk)
+    assert npend == self._npend, ("Improper account of PEND bytes", npend, self._npend)
 
     # All MAPD segments have some reason to be mapped?  Well, maybe not
     # exactly, since we are lazy about unmapping, or might be.
@@ -496,32 +507,81 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
       self._publish('unmapd', stk, tid, self._evp2eva(b), self._evp2eva(l))
     self._evp2pst.mark(pbase, plim-pbase, PageSt.UMAP)
 
+  # When exiting the WAIT sate, there are multiple ways things can go:
+  #
+  #   PEND: for some reason, this span of memory is neither reusable nor
+  #         revokable.  One assumes that eventually this will no longer
+  #         be true and so we will see PEND -> {TIDY, JUNK} transitions
+  #         here, too.
+  #
+  #   TIDY: This memory does not need to be run through a revocation pass.
+  #         Either we are running in an unsafe mode or there is some other
+  #         mechanism available, such as fast pointer invalidation
+  #         (MTE/SSM).
+  #
+  #  JUNK: This memory needs to be revoked before it can be reused.
+  #
+  # This function handles all of the associated logic.  The lists given
+  # should not contain coalescable regions for efficiency's sake, but I do
+  # not think anything will go wrong if they do.
+  def _mark_free(self, stk, tid, pends, tidys, junks):
+
+    for (loc, sz) in pends:
+      self._nwait -= sz
+      self._npend += sz
+      self._eva2sst.mark(loc, sz, SegSt.PEND)
+
+    for (loc, sz) in tidys:
+      self._mark_free_accounting_helper(loc, sz)
+      self._mark_tidy(loc, sz)
+
+      (qb, qsz, qv) = self._eva2sst.get(loc)
+      assert qv == SegSt.TIDY, (loc, sz, qb, qsz, qv, list(self._eva2sst))
+      self._mark_free_unmap_helper(stk, tid, qb, qsz)
+
+    for (loc, sz) in junks:
+
+      self._mark_free_accounting_helper(loc, sz)
+      self._eva2sst.mark(loc, sz, SegSt.JUNK)
+      self._njunk += sz
+
+      # If it happens that this span may be larger than the cached largest
+      # revokable span, invalidate the cache
+      if self._brscache is not None :
+        (brsnj, _, _) = self._brscache
+        (_, qsz, _) = self._eva2sst.get(loc, coalesce_with_values=sst_tj)
+        if qsz >= brsnj :
+          self._brscache = None
+
+      # Update the JUNK LRU
+      (qb, qsz) = dll_im_coalesced_insert(loc,sz,self._eva2sst,self._junklru,self._junkadn)
+
+      self._mark_free_unmap_helper(stk, tid, qb, qsz)
+
+  def _mark_free_accounting_helper(self, loc, sz):
+    for (qb, qsz, qv) in self._eva2sst[loc:loc+sz] :
+      lim = min(qb + qsz, loc + sz)
+      qb = max(loc, qb)
+      qsz = lim - qb
+
+      if qv == SegSt.PEND   : self._npend -= qsz
+      elif qv == SegSt.WAIT : self._nwait -= qsz
+      else :                  assert False
+
+  # If the span is large enough, go ensure that it is unmapped, save
+  # possibly for some material on either side.
+  # XXX configurable policy
+  def _mark_free_unmap_helper(self, stk, tid, qb, qsz):
+      if qsz > (16 * 2**self._pagelog) :
+        self._ensure_unmapped("free " + stk, tid, qb, qsz)
+
   def _free(self, stk, tid, loc):
     if self._paranoia > PARANOIA_STATE_PER_OPER : self._state_asserts()
     assert self._eva2sst[loc][2] == SegSt.WAIT, "free non-WAIT?"
 
     # Mark this span as junk
     sz = self._eva2sz.pop(loc)
-    self._eva2sst.mark(loc, sz, SegSt.JUNK)
-    self._nwait -= sz
-    self._njunk += sz
-
-    # If it happens that this span may be larger than the cached largest
-    # revokable span, invalidate the cache
-    if self._brscache is not None :
-      (brsnj, _, _) = self._brscache
-      (_, qsz, _) = self._eva2sst.get(loc, coalesce_with_values=sst_tj)
-      if qsz >= brsnj :
-        self._brscache = None
-
-    # Update the JUNK LRU
-    (qb, qsz) = dll_im_coalesced_insert(loc,sz,self._eva2sst,self._junklru,self._junkadn)
-
-    # If the JUNK span is large enough, go ensure that it is unmapped, save
-    # possibly for some material on either side.
-    # XXX configurable policy
-    if qsz > (16 * 2**self._pagelog) :
-      self._ensure_unmapped("free " + stk, tid, qb, qsz)
+    self._mark_free(stk, tid, [], [], [(loc,sz)])
 
   def _free_unsafe(self, stk, tid, loc):
     if self._paranoia > PARANOIA_STATE_PER_OPER : self._state_asserts()
@@ -529,15 +589,7 @@ class TraditionalAllocatorBase(RenamingAllocatorBase):
 
     # Immediately mark this span as TIDY, rather than JUNK
     sz = self._eva2sz.pop(loc)
-    self._nwait -= sz
-    self._mark_tidy(loc, sz)
-
-    # If the present TIDY span is quite large, go ahead and do an unmap
-    # XXX configurable policy
-    (qb, qsz, qv) = self._eva2sst.get(loc)
-    assert qv == SegSt.TIDY, (loc, sz, qb, qsz, qv, list(x for x in self._eva2sst))
-    if qsz > (16 * 2**self._pagelog) :
-      self._ensure_unmapped("free " + stk, tid, qb, qsz)
+    self._mark_free(stk, tid, [], [(loc,sz)], [])
 
 # --------------------------------------------------------------------- }}}
 # Realloc ------------------------------------------------------------- {{{
