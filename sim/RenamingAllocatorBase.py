@@ -59,17 +59,17 @@ class RenamingAllocatorBase (Publisher):
     if evao is not None :
 
       if self._try_realloc(stk_delegate, tid, evao, szn) : 
-        return self._publish('reallocd', stk, tid, evao, evao, evao+szn)
+        self._publish('reallocd', stk, tid, evao, evao, evao+szn)
+      else :
+        # otherwise, alloc new thing, free old thing
+        (evan, sznn) = self._alloc(stk_delegate, tid, szn)
+        self._free(stk_delegate, tid, evao)
 
-      # otherwise, alloc new thing, free old thing
-      (evan, sznn) = self._alloc(stk_delegate, tid, szn)
-      self._free(stk_delegate, tid, evao)
+        # Update TVA map; delete old then add new in case of equality
+        del self._tva2eva[begin_old]
+        self._tva2eva[begin_new] = evan
 
-      # Update TVA map; delete old then add new in case of equality
-      del self._tva2eva[begin_old]
-      self._tva2eva[begin_new] = evan
-
-      self._publish('reallocd', stk, tid, evao, evan, evan+sznn)
+        self._publish('reallocd', stk, tid, evao, evan, evan+sznn)
     else :
       # We don't seem to have that address on file; allocate it
       # (This should include NULL, yeah?)
